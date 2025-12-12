@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  app:
+    image: nofx-app
+    container_name: nofx
+    build: .
+    ports:
+      - "8600:8600"
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 10
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7
+    container_name: redis
+    restart: unless-stopped
