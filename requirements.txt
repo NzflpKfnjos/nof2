@@ -1,0 +1,8 @@
+aiohttp==3.13.2
+fastapi==0.124.4
+numpy==2.3.5
+python_binance==1.0.33
+redis==7.1.0
+Requests==2.32.5
+ta_lib==0.6.8
+uvicorn==0.38.0

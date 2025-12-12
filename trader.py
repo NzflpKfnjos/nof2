@@ -5,8 +5,17 @@ from binance.exceptions import BinanceAPIException
 from config import BINANCE_API_KEY, BINANCE_API_SECRET
 from account_positions import get_account_status
 import time
+import math
+from decimal import Decimal, ROUND_DOWN, getcontext
 
-client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+# 提高精度，避免浮点误差导致的精度报错
+getcontext().prec = 20
+
+client = Client(
+    api_key=BINANCE_API_KEY,
+    api_secret=BINANCE_API_SECRET,
+    requests_params={"timeout": 20}  # 全局超时放宽
+)
 REDIS_KEY = "trading_records"
 
 TP_SL_TYPES = {
@@ -14,37 +23,78 @@ TP_SL_TYPES = {
     "tp": ["TAKE_PROFIT", "TAKE_PROFIT_MARKET"]
 }
 
+# 缓存交易对精度信息，减少重复请求
+_symbol_info_cache = {}
+
+
 def save_trade_record(record: dict):
     """保存交易记录"""
     redis_client.lpush(REDIS_KEY, json.dumps(record))
 
+
+def _get_symbol_filters(symbol: str):
+    if symbol not in _symbol_info_cache:
+        info = client.futures_exchange_info(requests_params={"timeout": 20})
+        for s in info.get("symbols", []):
+            if s.get("symbol") == symbol:
+                _symbol_info_cache[symbol] = s.get("filters", [])
+                break
+    return _symbol_info_cache.get(symbol, [])
+
+
 def _normalize_qty(symbol: str, qty: float):
-    """按精度修正数量"""
-    info = client.futures_exchange_info()
-    for s in info.get("symbols", []):
-        if s.get("symbol") == symbol:
-            for f in s.get("filters", []):
-                if f.get("filterType") == "LOT_SIZE":
-                    step = float(f.get("stepSize", 1))
-                    min_qty = float(f.get("minQty", 0))
-                    if qty < min_qty:
-                        qty = min_qty
-                    qty = qty - (qty % step)
-                    return qty
-    return qty
+    """
+    按精度修正数量（向下取整到 stepSize，确保 ≥ minQty），避免 Precision is over the maximum 报错。
+    """
+    filters = _get_symbol_filters(symbol)
+    step = Decimal("1")
+    min_qty = Decimal("0")
+    for f in filters:
+        if f.get("filterType") == "LOT_SIZE":
+            step = Decimal(str(f.get("stepSize", "1")))
+            min_qty = Decimal(str(f.get("minQty", "0")))
+            break
+
+    qty_dec = Decimal(str(qty))
+    if qty_dec < min_qty:
+        qty_dec = min_qty
+    if step > 0:
+        qty_dec = (qty_dec // step) * step
+    if qty_dec <= 0:
+        qty_dec = min_qty
+    if step.as_tuple().exponent < 0:
+        qty_dec = qty_dec.quantize(step, rounding=ROUND_DOWN)
+    return float(qty_dec)
+
+
+def _normalize_price(symbol: str, price: float):
+    """按 tickSize 修正止盈/止损价格，避免价格精度拒单。"""
+    filters = _get_symbol_filters(symbol)
+    tick = Decimal("0.01")
+    for f in filters:
+        if f.get("filterType") == "PRICE_FILTER":
+            tick = Decimal(str(f.get("tickSize", "0.01")))
+            break
+
+    p_dec = Decimal(str(price))
+    if tick > 0:
+        p_dec = (p_dec // tick) * tick
+    if tick.as_tuple().exponent < 0:
+        p_dec = p_dec.quantize(tick, rounding=ROUND_DOWN)
+    return float(p_dec)
+
 
 def get_min_notional(symbol: str, default=0):
     """最小下单金额"""
-    info = client.futures_exchange_info()
-    for s in info.get("symbols", []):
-        if s.get("symbol") == symbol:
-            for f in s.get("filters", []):
-                if f.get("filterType") == "MIN_NOTIONAL":
-                    try:
-                        return float(f.get("notional", default))
-                    except Exception:
-                        return default
+    filters = _get_symbol_filters(symbol)
+    for f in filters:
+        if f.get("filterType") == "MIN_NOTIONAL":
+            try:
+                return float(f.get("notional", default))
+            except Exception:
+                return default
     return default
+
 
 def cancel_algo_order(symbol, algoId=None, clientAlgoId=None):
     if not algoId and not clientAlgoId:
@@ -82,7 +132,10 @@ def _cancel_tp_sl(symbol, position_side, cancel_sl=True, cancel_tp=True):
     # 1️⃣ 取消基础挂单
     # -------------------------------
     try:
-        open_orders = client.futures_get_open_orders(symbol=symbol)
+        open_orders = client.futures_get_open_orders(
+            symbol=symbol,
+            requests_params={"timeout": 20}
+        )
     except Exception as e:
         print(f"⚠ 获取基础挂单失败: {e}")
         open_orders = []
@@ -90,17 +143,19 @@ def _cancel_tp_sl(symbol, position_side, cancel_sl=True, cancel_tp=True):
     seen_ids = set()
     for o in open_orders:
         if (
-            o.get("positionSide") == position_side
-            and o.get("type") in types_to_cancel
-            and o.get("status") in ["NEW", "PARTIALLY_FILLED"]
+            o.get("type") in types_to_cancel
+            and o.get("status") in ["NEW", "PARTIALLY_FILLED", "UNTRIGGERED"]
+            and o.get("positionSide", position_side) == position_side
         ):
-            oid = o["orderId"]
+            oid = o.get("orderId")
+            if oid is None:
+                continue
             if oid not in seen_ids:
                 seen_ids.add(oid)
                 try:
                     client.futures_cancel_order(symbol=symbol, orderId=oid)
                     print(
-                        f"♻ 取消基础单 {position_side} {o['type']} | id={oid} stop={o.get('stopPrice')}"
+                        f"♻ 取消基础单 {position_side} {o.get('type')} | id={oid} stop={o.get('stopPrice')}"
                     )
                 except Exception as e:
                     print(f"⚠ 取消基础单失败 id={oid}: {e}")
@@ -109,13 +164,20 @@ def _cancel_tp_sl(symbol, position_side, cancel_sl=True, cancel_tp=True):
     # 2️⃣ 取消条件单（Algo Order）
     # -------------------------------
     try:
-        algo_orders = client.futures_get_open_orders(symbol=symbol, conditional=True)
+        algo_orders = client.futures_get_open_orders(
+            symbol=symbol,
+            conditional=True,
+            requests_params={"timeout": 20}
+        )
     except Exception as e:
         print(f"⚠ 获取条件单失败: {e}")
         algo_orders = []
 
     for o in algo_orders:
-        if o.get("positionSide") == position_side and o.get("orderType") in types_to_cancel:
+        if (
+            o.get("orderType") in types_to_cancel
+            and o.get("positionSide", position_side) == position_side
+        ):
             cancel_algo_order(symbol=symbol, algoId=o.get("algoId"), clientAlgoId=o.get("clientAlgoId"))
 
 
@@ -126,38 +188,53 @@ def _place_tp_sl(symbol, position_side, sl=None, tp=None):
     """
     results = []
     if sl:
+        sl_n = _normalize_price(symbol, sl)
         try:
             order = client.futures_create_order(
                 symbol=symbol,
                 side="SELL" if position_side == "LONG" else "BUY",
                 positionSide=position_side,
                 type="STOP_MARKET",  # 条件止损
-                stopPrice=float(sl),
+                stopPrice=float(sl_n),
                 closePosition=True,
                 timeInForce="GTC"
             )
-            print(f"🛑 设置止损条件单成功 {symbol}: {sl}")
+            print(f"🛑 设置止损条件单成功 {symbol}: {sl_n}")
             results.append(order)
         except Exception as e:
             print(f"⚠ 止损条件单下单失败 {symbol}: {e}")
 
     if tp:
+        tp_n = _normalize_price(symbol, tp)
         try:
             order = client.futures_create_order(
                 symbol=symbol,
                 side="SELL" if position_side == "LONG" else "BUY",
                 positionSide=position_side,
                 type="TAKE_PROFIT_MARKET",  # 条件止盈
-                stopPrice=float(tp),
+                stopPrice=float(tp_n),
                 closePosition=True,
                 timeInForce="GTC"
             )
-            print(f"🎯 设置止盈条件单成功 {symbol}: {tp}")
+            print(f"🎯 设置止盈条件单成功 {symbol}: {tp_n}")
             results.append(order)
         except Exception as e:
             print(f"⚠ 止盈条件单下单失败 {symbol}: {e}")
 
     return results
+
+
+def _with_retry(fn, attempts=3, delay=1, *args, **kwargs):
+    last = None
+    for i in range(attempts):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            if i < attempts - 1:
+                time.sleep(delay)
+    raise last
+
 
 def _update_tp_sl(symbol, position_side, sl=None, tp=None):
     """
@@ -185,12 +262,18 @@ def execute_trade(symbol: str, action: str, stop_loss=None, take_profit=None,
     - position_size: 指定 USDT 金额（会自动换算成合约数量）
     """
     try:
-        # 获取当前持仓和标记价格
+        # 获取当前持仓和标记价格（带重试）
         acc = get_account_status()
         pos = next((p for p in acc["positions"] if p["symbol"] == symbol), None)
-        mark = float(pos["mark_price"]) if pos else float(
-            client.futures_mark_price(symbol=symbol)["markPrice"]
-        )
+        if pos:
+            mark = float(pos["mark_price"])
+        else:
+            mark_price = _with_retry(
+                client.futures_mark_price, 3, 1,
+                symbol=symbol,
+                requests_params={"timeout": 20}
+            )
+            mark = float(mark_price["markPrice"])
 
         # 计算下单数量
         qty = None
@@ -217,7 +300,9 @@ def execute_trade(symbol: str, action: str, stop_loss=None, take_profit=None,
 
         # 下单函数
         def place_order(**kwargs):
-            order = client.futures_create_order(**kwargs)
+            kwargs = dict(kwargs)
+            kwargs.setdefault("requests_params", {"timeout": 20})
+            order = _with_retry(client.futures_create_order, 3, 1, **kwargs)
             save_trade_record({
                 "symbol": symbol,
                 "action": action,

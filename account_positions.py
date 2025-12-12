@@ -3,14 +3,18 @@ from binance.client import Client
 from config import BINANCE_API_KEY, BINANCE_API_SECRET
 from position_cache import position_records   # ← 引入缓存
 
-# 连接账户
-client = Client(api_key=BINANCE_API_KEY, api_secret=BINANCE_API_SECRET)
+# 连接账户，拉高超时防止网络抖动
+client = Client(
+    api_key=BINANCE_API_KEY,
+    api_secret=BINANCE_API_SECRET,
+    requests_params={"timeout": 20}
+)
 
 # ===== 新版：设置 recvWindow 与服务器时间检测 =====
 try:
     client.recvWindow = 10000  # 可选：10秒窗口，防止网络延迟
     # 检测服务器时间是否能正常获取
-    server_time = client.futures_time()  # 或 client.get_server_time()
+    server_time = client.futures_time()  # futures_time 不支持 requests_params
     print(f"✅ Binance 时间同步完成，服务器时间: {server_time['serverTime']}")
 except Exception as e:
     print("⚠ Binance 时间同步失败:", e)
@@ -37,7 +41,10 @@ def get_tp_sl_orders(symbol, position_side):
     # 1️⃣ 基础挂单
     # -------------------------------
     try:
-        open_orders = client.futures_get_open_orders(symbol=symbol)
+        open_orders = client.futures_get_open_orders(
+            symbol=symbol,
+            requests_params={"timeout": 20}
+        )
     except Exception:
         open_orders = []
 
@@ -62,7 +69,11 @@ def get_tp_sl_orders(symbol, position_side):
     # 2️⃣ 条件单（未触发）
     # -------------------------------
     try:
-        algo_orders = client.futures_get_open_orders(symbol=symbol, conditional=True)
+        algo_orders = client.futures_get_open_orders(
+            symbol=symbol,
+            conditional=True,
+            requests_params={"timeout": 20}
+        )
     except Exception:
         algo_orders = []
 
@@ -82,10 +93,10 @@ def get_tp_sl_orders(symbol, position_side):
     return orders
 
 def get_account_status():
-    data = client.futures_account()  # /fapi/v2/account
+    data = client.futures_account(requests_params={"timeout": 20})  # /fapi/v2/account
 
     # 获取所有交易对的标记价格
-    premium = client.futures_mark_price()
+    premium = client.futures_mark_price(requests_params={"timeout": 20})
     mark_dict = {item["symbol"]: float(item["markPrice"]) for item in premium}
 
     balance = float(data.get("totalWalletBalance", 0))
