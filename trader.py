@@ -34,7 +34,7 @@ def save_trade_record(record: dict):
 
 def _get_symbol_filters(symbol: str):
     if symbol not in _symbol_info_cache:
-        info = client.futures_exchange_info(requests_params={"timeout": 20})
+        info = client.futures_exchange_info()
         for s in info.get("symbols", []):
             if s.get("symbol") == symbol:
                 _symbol_info_cache[symbol] = s.get("filters", [])

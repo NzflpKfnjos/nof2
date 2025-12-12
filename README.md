@@ -39,6 +39,10 @@ pip install -r requirements.txt
 
 前端访问地址：http://127.0.0.1:8600
 
+
+
+docker logs -f nofx
+
 <img width="1918" height="903" alt="image" src="https://github.com/user-attachments/assets/0824bffa-b8c3-4f63-add3-acff1725dba9" />
 
 <img width="1918" height="903" alt="image" src="https://github.com/user-attachments/assets/728faf5f-2767-4303-905a-f52dcf46b905" />
