@@ -12,12 +12,20 @@ from trader import execute_trade
 
 tf_order = ["1d", "4h", "1h", "15m", "5m"]
 last_trigger = {tf: None for tf in tf_order}
+last_account_refresh = None
 
 async def schedule_loop_async():
     print("⏳ 启动最简调度循环（周期触发 → 下载K线 → 投喂AI + 自动交易）")
 
     while True:
         now = datetime.now(timezone.utc)
+        # 每分钟刷新账户与持仓，保证及时反应
+        global last_account_refresh
+        minute_key = now.strftime("%Y-%m-%d %H:%M")
+        if last_account_refresh != minute_key:
+            last_account_refresh = minute_key
+            get_account_status()
+
         m = now.minute
         h = now.hour
         current_key = None
