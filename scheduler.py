@@ -11,7 +11,7 @@ from database import redis_client
 from trader import execute_trade
 
 last_account_refresh = None
-last_minute_job = None
+last_cycle_job = None
 
 async def schedule_loop_async():
     print("⏳ 启动最简调度循环（周期触发 → 下载K线 → 投喂AI + 自动交易）")
@@ -25,10 +25,11 @@ async def schedule_loop_async():
             last_account_refresh = minute_key
             get_account_status()
 
-        # 每分钟执行一次完整流程（监控池构建、K线下载、指标、AI、交易）
-        global last_minute_job
-        if last_minute_job != minute_key:
-            last_minute_job = minute_key
+        # 每 3 分钟执行一次完整流程（监控池构建、K线下载、指标、AI、交易）
+        global last_cycle_job
+        cycle_key = now.strftime("%Y-%m-%d %H:") + f"{(now.minute // 3) * 3:02d}"
+        if last_cycle_job != cycle_key:
+            last_cycle_job = cycle_key
 
             # 🔄 再次刷新持仓缓存（冗余但确保及时）
             get_account_status()
