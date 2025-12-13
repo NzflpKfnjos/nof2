@@ -26,9 +26,6 @@ TP_SL_TYPES = {
 # 缓存交易对精度信息，减少重复请求
 _symbol_info_cache = {}
 
-# 盈亏达到该值（USDT）后，止损至少拉到盈亏平衡价
-MIN_PROFIT_BE_USDT = 0.5
-
 
 def save_trade_record(record: dict):
     """保存交易记录"""
@@ -241,30 +238,26 @@ def _with_retry(fn, attempts=3, delay=1, *args, **kwargs):
 
 def _enforce_breakeven_stop(pos, stop_loss):
     """
-    当持仓浮盈达到阈值时，将止损提高/压低到不低于（多）/不高于（空）入场价。
-    如果 AI 未返回止损，在满足条件时也会自动设置为入场价。
+    将止损限制在仓位的损益两平价格以内：
+    - 多仓：止损不低于入场价
+    - 空仓：止损不高于入场价
     """
-    if not pos:
+    if not pos or stop_loss is None:
         return stop_loss
 
-    pnl = float(pos.get("pnl", 0))
-    if pnl < MIN_PROFIT_BE_USDT:
+    try:
+        sl = float(stop_loss)
+    except (TypeError, ValueError):
         return stop_loss
 
     entry = float(pos.get("entry", 0))
     size = float(pos.get("size", 0))
 
-    # 多仓：止损不低于入场；空仓：止损不高于入场
     if size > 0:
-        if stop_loss is None or stop_loss < entry:
-            return entry
-        return max(stop_loss, entry)
+        return max(sl, entry)
     elif size < 0:
-        if stop_loss is None or stop_loss > entry:
-            return entry
-        return min(stop_loss, entry)
-    else:
-        return stop_loss
+        return min(sl, entry)
+    return stop_loss
 
 
 def _update_tp_sl(symbol, position_side, sl=None, tp=None):
@@ -306,7 +299,7 @@ def execute_trade(symbol: str, action: str, stop_loss=None, take_profit=None,
             )
             mark = float(mark_price["markPrice"])
 
-        # 盈利保护：当浮盈达到阈值时，止损至少回到入场价
+        # 止损保护：止损价格不得低于/高于该仓位的盈亏平衡价
         stop_loss = _enforce_breakeven_stop(pos, stop_loss)
 
         # 计算下单数量
