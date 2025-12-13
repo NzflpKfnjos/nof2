@@ -15,6 +15,15 @@ services:
       - redis
     restart: unless-stopped
 
+  get-main:
+    image: nofx-app
+    container_name: nofx-get-main
+    build: .
+    command:
+      ["python3", "get_main.py", "--auto-sl", "--no-clear"]
+    tty: true
+    restart: unless-stopped
+
   redis:
     image: redis:7
     container_name: redis

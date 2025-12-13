@@ -39,6 +39,109 @@ pip install -r requirements.txt
 
 前端访问地址：http://127.0.0.1:8600
 
+---
+
+## 持仓监控（get_main.py）
+
+`get_main.py` 用于**实时查看币安合约持仓**：标记价、开仓价、未实现盈亏、收益率、杠杆、方向（做多/做空）、当前止损价，并支持“**自动把止损价一步一步推到两平价（保本价）**”。
+
+### 1）准备
+
+- 需要币安 API Key/Secret（合约权限）。
+- 读取优先级：环境变量 `BINANCE_API_KEY` / `BINANCE_API_SECRET` → `config.py`
+
+### 2）基础用法（只查看）
+
+```bash
+python get_main.py
+```
+
+常用参数：
+
+```bash
+# 每 2 秒刷新一次
+python get_main.py --interval 2
+
+# 只获取一次就退出
+python get_main.py --once
+
+# 只看指定交易对
+python get_main.py --symbols BASUSDT,BTCUSDT
+
+# 不清屏（适合日志/排查）
+python get_main.py --no-clear
+```
+
+### 3）自动止损：逐步推到两平价（实盘会撤单+下单）
+
+> ⚠ 注意：开启后会真实操作你的账户（撤销已有止损单并重新下 `STOP_MARKET(closePosition=True)`）。不确定就先用 `--sl-dry-run` 模拟。
+
+```bash
+# 只模拟，不真实撤单/下单（推荐先跑这个确认行为）
+python get_main.py --auto-sl --sl-dry-run --sl-verbose --no-clear
+
+# 实盘自动推进止损到两平价
+python get_main.py --auto-sl
+```
+
+行为说明：
+
+- 两平价（保本价）当前按**开仓价 entry** 计算。
+- 默认模式是 `--sl-mode lock_profit`：盈利时止损**至少到开仓价**，并按照 `--sl-trail-pct` 随价格上移/下移，用于**锁定利润**。
+- 可切回 `--sl-mode breakeven`：只把止损逐步推到两平价（不额外锁盈）。
+- **做多**：只有当 `标记价 >= 两平价`（并留出 `--sl-buffer-ticks` 的安全距离）才会开始推进；否则把止损设到两平价会**立即触发**。
+- **做空**：只有当 `标记价 <= 两平价`（并留出安全距离）才会开始推进。
+- “一步一步”模式下由 `--sl-step-pct` 控制（每次推进的步长，且不会小于 tickSize）。
+- 为避免频繁改单，`--sl-min-interval` 限制同一合约同一方向的最小更新间隔。
+
+参数参考：
+
+```bash
+# 每次推进 0.10%（更快），每 10 秒最多更新一次，止损与标记价至少间隔 3 个 tick
+python get_main.py --auto-sl --sl-step-pct 0.10 --sl-min-interval 10 --sl-buffer-ticks 3
+
+# 锁盈模式：回撤 0.5% 触发止损（越小越贴近，越容易被扫）
+python get_main.py --auto-sl --sl-mode lock_profit --sl-trail-pct 0.5
+
+# 锁盈模式：浮盈达到 0.5% 才开始推止损（默认 0.5%）
+python get_main.py --auto-sl --sl-mode lock_profit --sl-activate-profit-pct 0.5
+
+# 只推两平（不锁盈）
+python get_main.py --auto-sl --sl-mode breakeven
+
+# 止损/挂单信息每 10 秒刷新一次（更省请求，降低触发 -1003 的概率）
+python get_main.py --sl-refresh 10
+
+# 将“止损设置/撤单/下单”的记录追加写入文件，方便回看
+python get_main.py --auto-sl --sl-log-file sl.log
+```
+
+### 3.1）用 Docker 部署 get_main.py（默认读取 config.py）
+
+1）确保 `config.py` 已填写币安 Key/Secret（和本地运行一致）。
+
+2）启动持仓监控容器（`get-main` 默认执行：`python get_main.py --auto-sl`，且锁盈触发阈值默认 0.5%）：
+
+```bash
+docker compose up -d --build get-main
+```
+
+3）查看实时日志：
+
+```bash
+docker logs -f nofx-get-main
+```
+
+> 注意：`get-main` 默认带 `--auto-sl` 会真实撤单+下止损单；如果你只想查看，把 `docker-compose.yml` 里 `get-main` 的 `command` 去掉 `--auto-sl` 或改成 `--sl-dry-run`。
+
+### 4）关于 -1003 Too many requests（频率限制）
+
+如果看到：`APIError(code=-1003): Too many requests...`
+
+- 说明同一 IP 下请求过于频繁（或同时跑了多个轮询脚本）。
+- 建议把 `--interval` / `--sl-refresh` 调大，或者减少同 IP 下同时运行的程序。
+- 更理想的实时方案是使用 websocket（避免高频轮询）。
+
 docker rm -f
 docker rmi -f
 docker logs -f nofx
@@ -53,6 +156,3 @@ docker compose up -d --build
 <img width="1918" height="903" alt="image" src="https://github.com/user-attachments/assets/9f1c88d1-c787-482c-9016-69ebf0b468ce" />
 
 <img width="1918" height="903" alt="image" src="https://github.com/user-attachments/assets/70422b46-50ff-4477-badd-ec932f943837" />
-
-
-
