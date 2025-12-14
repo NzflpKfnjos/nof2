@@ -1,5 +1,3 @@
-import argparse
-import math
 import os
 import sys
 import time
@@ -22,6 +20,17 @@ _sl_snapshot_cache: Dict[Tuple[str, str], Tuple[float, int, float]] = {}
 _last_rate_limit_notice_ts: float = 0.0
 _rate_limit_backoff_sec: float = 0.0
 _sl_action_history: List[str] = []
+
+DEFAULT_INTERVAL_SEC = 1.0
+DEFAULT_CLEAR_SCREEN = True
+DEFAULT_SL_ENABLED = True
+DEFAULT_SL_MAX_LOSS_PCT = 0.5
+DEFAULT_SL_MIN_INTERVAL_SEC = 5.0
+DEFAULT_SL_BUFFER_TICKS = 2
+DEFAULT_SL_REFRESH_SEC = 5.0
+DEFAULT_SL_LOG_LINES = 30
+DEFAULT_SL_LOG_FILE = ""
+DEFAULT_SL_LOG_KEEP = 200
 
 
 def _load_keys():
@@ -191,7 +200,12 @@ def _fetch_positions_snapshot(client: Client):
 
     positions = []
     for p in raw_positions:
-        qty = float(p.get("positionAmt") or 0)
+        qty_raw = str(p.get("positionAmt") or "0")
+        try:
+            qty_dec = Decimal(qty_raw)
+        except Exception:
+            qty_dec = Decimal(0)
+        qty = float(qty_dec)
         symbol = p.get("symbol") or ""
         entry = float(p.get("entryPrice") or 0)
         mark = _safe_float(p.get("markPrice"), 0.0)
@@ -202,7 +216,9 @@ def _fetch_positions_snapshot(client: Client):
         position_side = _get_position_side(p, qty)
         side = "做多" if position_side == "LONG" else "做空" if position_side == "SHORT" else position_side
 
+        qty_abs_dec = abs(qty_dec)
         qty_abs = abs(qty)
+        qty_str = format(qty_abs_dec.normalize(), "f")
         notional = qty_abs * mark
         denom = qty_abs * entry
         pnl_pct = (pnl / denom * 100.0) if denom > 0 else 0.0
@@ -213,6 +229,7 @@ def _fetch_positions_snapshot(client: Client):
                 "side": side,
                 "position_side": position_side,
                 "qty": qty_abs,
+                "qty_str": qty_str,
                 "entry": entry,
                 "mark": mark,
                 "notional": notional,
@@ -425,6 +442,28 @@ def _place_stop_market_close_position(client: Client, symbol: str, position_side
     )
 
 
+def _place_market_close_position(client: Client, symbol: str, position_side: str, quantity: str) -> dict:
+    quantity = (quantity or "").strip()
+    if not quantity or quantity == "0":
+        return {}
+
+    if position_side == "LONG":
+        side = "SELL"
+    elif position_side == "SHORT":
+        side = "BUY"
+    else:
+        return {}
+
+    return client.futures_create_order(
+        symbol=symbol,
+        side=side,
+        positionSide=position_side,
+        type="MARKET",
+        quantity=quantity,
+        reduceOnly=True,
+    )
+
+
 def _append_sl_history(lines: List[str], *, max_keep: int, log_file: str) -> None:
     if not lines:
         return
@@ -442,36 +481,30 @@ def _append_sl_history(lines: List[str], *, max_keep: int, log_file: str) -> Non
             pass
 
 
-def _auto_step_sl_to_breakeven(
+def _auto_ensure_sl_max_loss(
     client: Client,
     snapshot: dict,
     *,
-    step_pct: float,
+    max_loss_pct: float,
     min_interval_sec: float,
     buffer_ticks: int,
     dry_run: bool,
-    symbols_filter: Optional[Set[str]],
     verbose: bool,
-    mode: str,
-    trail_pct: float,
-    activate_profit_pct: float,
 ) -> List[str]:
     messages: List[str] = []
     now_ts = time.time()
 
     for p in snapshot.get("positions", []):
         symbol = p["symbol"]
-        if symbols_filter and symbol not in symbols_filter:
-            continue
 
         position_side = p["position_side"]
         entry = float(p["entry"])
         mark = float(p["mark"])
+        qty_str = str(p.get("qty_str") or "")
 
         if entry <= 0 or mark <= 0:
             continue
 
-        liangping = entry  # 两平/保本价：这里按开仓价处理
         tick = _get_tick_size(client, symbol)
         buffer_price = max(tick * float(max(0, buffer_ticks)), 0.0)
 
@@ -480,21 +513,6 @@ def _auto_step_sl_to_breakeven(
             profit_pct = (mark - entry) / entry * 100.0 if entry > 0 else 0.0
         elif position_side == "SHORT":
             profit_pct = (entry - mark) / entry * 100.0 if entry > 0 else 0.0
-
-        if position_side == "LONG":
-            if liangping > (mark - buffer_price):
-                if verbose:
-                    messages.append(
-                        f"跳过：{symbol} 做多 未到两平（标记价 {mark:.6f} < 两平价 {liangping:.6f}），为避免止损立即触发不推进"
-                    )
-                continue
-        elif position_side == "SHORT":
-            if liangping < (mark + buffer_price):
-                if verbose:
-                    messages.append(
-                        f"跳过：{symbol} 做空 未到两平（标记价 {mark:.6f} > 两平价 {liangping:.6f}），为避免止损立即触发不推进"
-                    )
-                continue
         else:
             continue
 
@@ -508,67 +526,69 @@ def _auto_step_sl_to_breakeven(
         stop_orders = _collect_stop_orders(open_orders, algo_orders, symbol, position_side)
         current_sl = _pick_current_sl_price(position_side, stop_orders)
 
-        new_sl: Optional[float] = None
-        mode = (mode or "").strip().lower()
+        if profit_pct <= -abs(float(max_loss_pct)):
+            if verbose:
+                messages.append(
+                    f"触发：{symbol} {('做多' if position_side=='LONG' else '做空')} 当前收益率 {profit_pct:.2f}% <= -{abs(float(max_loss_pct)):.2f}%"
+                )
 
-        if mode in {"lock_profit", "lock-profit"}:
-            if profit_pct < float(activate_profit_pct):
-                if verbose:
-                    messages.append(
-                        f"跳过：{symbol} {('做多' if position_side=='LONG' else '做空')} 浮盈 {profit_pct:.2f}% < 触发阈值 {float(activate_profit_pct):.2f}%"
-                    )
+            if dry_run:
+                messages.append(f"模拟：{symbol} {position_side} 市价平仓 qty={qty_str or '-'}")
+                _last_sl_update_at[key] = now_ts
                 continue
-            if position_side == "LONG":
-                trail_candidate = mark * (1.0 - float(trail_pct) / 100.0)
-                target = max(liangping, trail_candidate)
-                target = min(target, mark - buffer_price)
-                if current_sl is not None and current_sl > 0:
-                    target = max(target, current_sl)
-                new_sl = _normalize_price_floor(client, symbol, float(target))
-            else:  # SHORT
-                trail_candidate = mark * (1.0 + float(trail_pct) / 100.0)
-                target = min(liangping, trail_candidate)
-                target = max(target, mark + buffer_price)
-                if current_sl is not None and current_sl > 0:
-                    target = min(target, current_sl)
-                new_sl = _normalize_price_ceil(client, symbol, float(target))
 
+            try:
+                _cancel_existing_sl_orders(client, symbol, position_side, stop_orders)
+                order = _place_market_close_position(client, symbol, position_side, qty_str)
+                _last_sl_update_at[key] = now_ts
+                oid = order.get("orderId") or order.get("clientOrderId") or ""
+                oid_txt = f"；市价平仓单 {oid}" if oid else ""
+                messages.append(f"已平仓：{symbol} {position_side}（触发最大亏损 -{abs(float(max_loss_pct)):.2f}%）{oid_txt}")
+            except Exception as e:
+                _last_sl_update_at[key] = now_ts
+                messages.append(f"失败：{symbol} {position_side} 市价平仓异常：{e}")
+            continue
+
+        target_sl: Optional[float] = None
+        loss_ratio = abs(float(max_loss_pct)) / 100.0
+        if position_side == "LONG":
+            target_sl = entry * (1.0 - loss_ratio)
+            target_sl = _normalize_price_floor(client, symbol, float(target_sl))
+        elif position_side == "SHORT":
+            target_sl = entry * (1.0 + loss_ratio)
+            target_sl = _normalize_price_ceil(client, symbol, float(target_sl))
         else:
-            step_amount = abs(liangping) * (float(step_pct) / 100.0)
-            step_amount = max(step_amount, tick)
-            step_amount = max(step_amount, 0.0)
+            continue
 
-            if current_sl is None or current_sl <= 0:
-                new_sl = liangping
-            else:
-                if position_side == "LONG":
-                    if current_sl >= liangping:
-                        continue
-                    new_sl = min(current_sl + step_amount, liangping)
-                elif position_side == "SHORT":
-                    if current_sl <= liangping:
-                        continue
-                    new_sl = max(current_sl - step_amount, liangping)
+        if target_sl is None or target_sl <= 0:
+            continue
 
-            if new_sl is None:
-                continue
+        needs_update = False
+        if current_sl is None or current_sl <= 0:
+            needs_update = True
+        else:
+            if position_side == "LONG" and float(current_sl) < float(target_sl) - tick:
+                needs_update = True
+            elif position_side == "SHORT" and float(current_sl) > float(target_sl) + tick:
+                needs_update = True
+            elif len(stop_orders) != 1 and abs(float(current_sl) - float(target_sl)) < tick:
+                needs_update = True
 
-            if position_side == "LONG":
-                new_sl = min(new_sl, mark - buffer_price)
-                new_sl = _normalize_price_floor(client, symbol, float(new_sl))
-            else:  # SHORT
-                new_sl = max(new_sl, mark + buffer_price)
-                new_sl = _normalize_price_ceil(client, symbol, float(new_sl))
+        if not needs_update:
+            continue
+
+        new_sl = float(target_sl)
 
         if new_sl is None:
             continue
 
         if current_sl is not None and current_sl > 0 and abs(float(new_sl) - float(current_sl)) < tick:
-            continue
+            if len(stop_orders) == 1:
+                continue
 
         if dry_run:
             messages.append(
-                f"模拟：{symbol} {('做多' if position_side=='LONG' else '做空')} 止损 {current_sl or 0:.6f} -> {new_sl:.6f}（两平 {liangping:.6f}）"
+                f"模拟：{symbol} {('做多' if position_side=='LONG' else '做空')} 止损 {current_sl or 0:.6f} -> {new_sl:.6f}（最大亏损 -{abs(float(max_loss_pct)):.2f}%）"
             )
             _last_sl_update_at[key] = now_ts
             continue
@@ -581,7 +601,7 @@ def _auto_step_sl_to_breakeven(
             canceled_txt = f"；已撤销 {len(canceled)} 个旧止损" if canceled else "；无旧止损可撤销"
             oid_txt = f"；新止损单 {oid}" if oid else ""
             messages.append(
-                f"已更新：{symbol} {('做多' if position_side=='LONG' else '做空')} 止损 {current_sl or 0:.6f} -> {new_sl:.6f}（两平 {liangping:.6f}）{canceled_txt}{oid_txt}"
+                f"已更新：{symbol} {('做多' if position_side=='LONG' else '做空')} 止损 {current_sl or 0:.6f} -> {new_sl:.6f}（最大亏损 -{abs(float(max_loss_pct)):.2f}%）{canceled_txt}{oid_txt}"
             )
         except Exception as e:
             _last_sl_update_at[key] = now_ts
@@ -642,100 +662,10 @@ def _print_snapshot(snapshot: dict, symbols_filter: Optional[Set[str]], auto_sl_
         print("(当前无持仓)")
 
 
-def main(argv: List[str]) -> int:
+def main() -> int:
     global _last_rate_limit_notice_ts
     global _rate_limit_backoff_sec
-
-    parser = argparse.ArgumentParser(description="实时查看币安合约持仓：标记价/收益/多空，并可自动把止损逐步推到两平价")
-    parser.add_argument("--interval", type=float, default=1.0, help="刷新间隔秒数（默认 1）")
-    parser.add_argument("--once", action="store_true", help="只获取一次后退出")
-    parser.add_argument("--no-clear", action="store_true", help="不清屏（默认会清屏刷新）")
-    parser.add_argument(
-        "--symbols",
-        type=str,
-        default="",
-        help="只显示指定交易对，逗号分隔，例如 BTCUSDT,ETHUSDT",
-    )
-    parser.add_argument(
-        "--auto-sl",
-        action="store_true",
-        help="自动把止损价一步一步推到两平/保本价（会真实撤单+下 STOP_MARKET，请确认账号为实盘）",
-    )
-    parser.add_argument(
-        "--sl-mode",
-        type=str,
-        default="lock_profit",
-        help="自动止损模式：lock_profit(锁盈，盈利时止损>=开仓价并随价格上移) 或 breakeven(只推到两平；默认 lock_profit)",
-    )
-    parser.add_argument(
-        "--sl-trail-pct",
-        type=float,
-        default=0.5,
-        help="锁盈模式下：止损距离标记价的回撤百分比（默认 0.5%%；越小越贴近，越容易被扫）",
-    )
-    parser.add_argument(
-        "--sl-activate-profit-pct",
-        type=float,
-        default=0.5,
-        help="锁盈模式触发阈值：浮盈达到该百分比才开始推止损（默认 0.5%%）",
-    )
-    parser.add_argument(
-        "--sl-step-pct",
-        type=float,
-        default=0.05,
-        help="每次止损推进的步长（百分比，默认 0.05 表示 0.05%%，会自动不小于 tickSize）",
-    )
-    parser.add_argument(
-        "--sl-min-interval",
-        type=float,
-        default=5.0,
-        help="同一合约同一方向最小更新间隔秒数（默认 5）",
-    )
-    parser.add_argument(
-        "--sl-buffer-ticks",
-        type=int,
-        default=2,
-        help="止损与当前标记价保持的最小间隔（tick 数，默认 2）",
-    )
-    parser.add_argument(
-        "--sl-refresh",
-        type=float,
-        default=5.0,
-        help="止损价/止损单刷新频率秒数（默认 5，过低会更容易触发限流）",
-    )
-    parser.add_argument(
-        "--sl-verbose",
-        action="store_true",
-        help="输出自动止损的跳过原因/更多日志（信息会比较多）",
-    )
-    parser.add_argument(
-        "--sl-log-lines",
-        type=int,
-        default=30,
-        help="显示最近多少条止损操作记录（默认 30）",
-    )
-    parser.add_argument(
-        "--sl-log-file",
-        type=str,
-        default="",
-        help="将止损操作记录追加写入文件（例如 sl.log；默认不写）",
-    )
-    parser.add_argument(
-        "--sl-log-keep",
-        type=int,
-        default=200,
-        help="内存中保留的止损操作记录条数（默认 200）",
-    )
-    parser.add_argument(
-        "--sl-dry-run",
-        action="store_true",
-        help="只打印将要更新的止损，不真实下单/撤单",
-    )
-    args = parser.parse_args(argv)
-
     symbols_filter = None
-    if args.symbols.strip():
-        symbols_filter = {s.strip().upper() for s in args.symbols.split(",") if s.strip()}
 
     client = _build_client()
 
@@ -746,34 +676,30 @@ def main(argv: List[str]) -> int:
                 _rate_limit_backoff_sec = 0.0
 
                 if snapshot.get("positions"):
-                    _enrich_snapshot_with_sl(client, snapshot, refresh_sec=float(args.sl_refresh))
+                    _enrich_snapshot_with_sl(client, snapshot, refresh_sec=float(DEFAULT_SL_REFRESH_SEC))
 
                 auto_messages: List[str] = []
-                if args.auto_sl:
-                    auto_messages = _auto_step_sl_to_breakeven(
+                if DEFAULT_SL_ENABLED:
+                    auto_messages = _auto_ensure_sl_max_loss(
                         client,
                         snapshot,
-                        step_pct=float(args.sl_step_pct),
-                        min_interval_sec=float(args.sl_min_interval),
-                        buffer_ticks=int(args.sl_buffer_ticks),
-                        dry_run=bool(args.sl_dry_run),
-                        symbols_filter=symbols_filter,
-                        verbose=bool(args.sl_verbose),
-                        mode=str(args.sl_mode or ""),
-                        trail_pct=float(args.sl_trail_pct),
-                        activate_profit_pct=float(args.sl_activate_profit_pct),
+                        max_loss_pct=float(DEFAULT_SL_MAX_LOSS_PCT),
+                        min_interval_sec=float(DEFAULT_SL_MIN_INTERVAL_SEC),
+                        buffer_ticks=int(DEFAULT_SL_BUFFER_TICKS),
+                        dry_run=False,
+                        verbose=False,
                     )
                     _append_sl_history(
                         auto_messages,
-                        max_keep=int(args.sl_log_keep),
-                        log_file=str(args.sl_log_file or ""),
+                        max_keep=int(DEFAULT_SL_LOG_KEEP),
+                        log_file=str(DEFAULT_SL_LOG_FILE or ""),
                     )
 
-                if not args.no_clear:
+                if DEFAULT_CLEAR_SCREEN:
                     _clear_screen()
-                _print_snapshot(snapshot, symbols_filter, bool(args.auto_sl))
-                if args.auto_sl:
-                    n = max(0, int(args.sl_log_lines))
+                _print_snapshot(snapshot, symbols_filter, bool(DEFAULT_SL_ENABLED))
+                if DEFAULT_SL_ENABLED:
+                    n = max(0, int(DEFAULT_SL_LOG_LINES))
                     if n > 0 and _sl_action_history:
                         print()
                         print("止损操作记录（最近 {} 条）".format(min(n, len(_sl_action_history))))
@@ -787,23 +713,21 @@ def main(argv: List[str]) -> int:
                     if now_ts - _last_rate_limit_notice_ts > 5.0:
                         _last_rate_limit_notice_ts = now_ts
                         print(
-                            "⚠ 触发 Binance 频率限制(-1003)：当前请求过于频繁/同IP程序过多，已自动退避等待…",
+                            "WARN: 触发 Binance 频率限制(-1003)：当前请求过于频繁/同IP程序过多，已自动退避等待...",
                             file=sys.stderr,
                         )
                     _rate_limit_backoff_sec = 3.0 if _rate_limit_backoff_sec <= 0 else min(30.0, _rate_limit_backoff_sec * 2.0)
                     time.sleep(_rate_limit_backoff_sec)
                 else:
-                    print(f"❌ Binance 接口异常：{e}", file=sys.stderr)
+                    print(f"ERROR: Binance 接口异常：{e}", file=sys.stderr)
             except Exception as e:
-                print(f"❌ 运行异常：{e}", file=sys.stderr)
+                print(f"ERROR: 运行异常：{e}", file=sys.stderr)
 
-            if args.once:
-                return 0
-            time.sleep(max(0.2, float(args.interval)))
+            time.sleep(max(0.2, float(DEFAULT_INTERVAL_SEC)))
     except KeyboardInterrupt:
         print("\n已退出。")
         return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(main())

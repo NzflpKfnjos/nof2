@@ -20,7 +20,7 @@ services:
     container_name: nofx-get-main
     build: .
     command:
-      ["python3", "get_main.py", "--auto-sl", "--no-clear"]
+      ["python3", "get_main.py"]
     tty: true
     restart: unless-stopped
 
