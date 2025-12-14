@@ -1,4 +1,5 @@
 import os
+import os
 import sys
 import time
 from datetime import datetime
@@ -25,6 +26,8 @@ DEFAULT_INTERVAL_SEC = 1.0
 DEFAULT_CLEAR_SCREEN = True
 DEFAULT_SL_ENABLED = True
 DEFAULT_SL_MAX_LOSS_PCT = 0.5
+DEFAULT_SL_LOCK_PROFIT_ACTIVATE_PCT = 0.5
+DEFAULT_SL_TRAIL_PCT = 0.5
 DEFAULT_SL_MIN_INTERVAL_SEC = 5.0
 DEFAULT_SL_BUFFER_TICKS = 2
 DEFAULT_SL_REFRESH_SEC = 5.0
@@ -481,11 +484,13 @@ def _append_sl_history(lines: List[str], *, max_keep: int, log_file: str) -> Non
             pass
 
 
-def _auto_ensure_sl_max_loss(
+def _auto_manage_sl(
     client: Client,
     snapshot: dict,
     *,
     max_loss_pct: float,
+    lock_profit_activate_pct: float,
+    trail_pct: float,
     min_interval_sec: float,
     buffer_ticks: int,
     dry_run: bool,
@@ -549,14 +554,50 @@ def _auto_ensure_sl_max_loss(
                 messages.append(f"失败：{symbol} {position_side} 市价平仓异常：{e}")
             continue
 
-        target_sl: Optional[float] = None
         loss_ratio = abs(float(max_loss_pct)) / 100.0
+        lock_active = profit_pct >= float(lock_profit_activate_pct)
+        target_sl: Optional[float] = None
+
         if position_side == "LONG":
-            target_sl = entry * (1.0 - loss_ratio)
+            base_sl = entry * (1.0 - loss_ratio)
+            base_sl = _normalize_price_floor(client, symbol, float(base_sl))
+            if lock_active:
+                trail_candidate = mark * (1.0 - float(trail_pct) / 100.0)
+                target_sl = max(base_sl, entry, float(trail_candidate))
+                safe_max = mark - buffer_price
+                if safe_max <= 0:
+                    continue
+                if target_sl >= safe_max:
+                    target_sl = safe_max
+            else:
+                target_sl = base_sl
+
             target_sl = _normalize_price_floor(client, symbol, float(target_sl))
+            if float(target_sl) >= mark - buffer_price:
+                continue
+
+            if current_sl is not None and current_sl > 0:
+                target_sl = max(float(target_sl), float(current_sl))
+
         elif position_side == "SHORT":
-            target_sl = entry * (1.0 + loss_ratio)
+            base_sl = entry * (1.0 + loss_ratio)
+            base_sl = _normalize_price_ceil(client, symbol, float(base_sl))
+            if lock_active:
+                trail_candidate = mark * (1.0 + float(trail_pct) / 100.0)
+                target_sl = min(base_sl, entry, float(trail_candidate))
+                safe_min = mark + buffer_price
+                if target_sl <= safe_min:
+                    target_sl = safe_min
+            else:
+                target_sl = base_sl
+
             target_sl = _normalize_price_ceil(client, symbol, float(target_sl))
+            if float(target_sl) <= mark + buffer_price:
+                continue
+
+            if current_sl is not None and current_sl > 0:
+                target_sl = min(float(target_sl), float(current_sl))
+
         else:
             continue
 
@@ -586,9 +627,15 @@ def _auto_ensure_sl_max_loss(
             if len(stop_orders) == 1:
                 continue
 
+        mode_txt = (
+            f"锁盈>=保本+跟踪({float(lock_profit_activate_pct):.2f}%触发, 回撤{float(trail_pct):.2f}%)"
+            if lock_active
+            else f"最大亏损 -{abs(float(max_loss_pct)):.2f}%"
+        )
+
         if dry_run:
             messages.append(
-                f"模拟：{symbol} {('做多' if position_side=='LONG' else '做空')} 止损 {current_sl or 0:.6f} -> {new_sl:.6f}（最大亏损 -{abs(float(max_loss_pct)):.2f}%）"
+                f"模拟：{symbol} {('做多' if position_side=='LONG' else '做空')} 止损 {current_sl or 0:.6f} -> {new_sl:.6f}（{mode_txt}）"
             )
             _last_sl_update_at[key] = now_ts
             continue
@@ -601,7 +648,7 @@ def _auto_ensure_sl_max_loss(
             canceled_txt = f"；已撤销 {len(canceled)} 个旧止损" if canceled else "；无旧止损可撤销"
             oid_txt = f"；新止损单 {oid}" if oid else ""
             messages.append(
-                f"已更新：{symbol} {('做多' if position_side=='LONG' else '做空')} 止损 {current_sl or 0:.6f} -> {new_sl:.6f}（最大亏损 -{abs(float(max_loss_pct)):.2f}%）{canceled_txt}{oid_txt}"
+                f"已更新：{symbol} {('做多' if position_side=='LONG' else '做空')} 止损 {current_sl or 0:.6f} -> {new_sl:.6f}（{mode_txt}）{canceled_txt}{oid_txt}"
             )
         except Exception as e:
             _last_sl_update_at[key] = now_ts
@@ -680,10 +727,12 @@ def main() -> int:
 
                 auto_messages: List[str] = []
                 if DEFAULT_SL_ENABLED:
-                    auto_messages = _auto_ensure_sl_max_loss(
+                    auto_messages = _auto_manage_sl(
                         client,
                         snapshot,
                         max_loss_pct=float(DEFAULT_SL_MAX_LOSS_PCT),
+                        lock_profit_activate_pct=float(DEFAULT_SL_LOCK_PROFIT_ACTIVATE_PCT),
+                        trail_pct=float(DEFAULT_SL_TRAIL_PCT),
                         min_interval_sec=float(DEFAULT_SL_MIN_INTERVAL_SEC),
                         buffer_ticks=int(DEFAULT_SL_BUFFER_TICKS),
                         dry_run=False,
