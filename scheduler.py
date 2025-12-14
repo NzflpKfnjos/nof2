@@ -13,6 +13,32 @@ from trader import execute_trade
 tf_order = ["1d", "4h", "1h", "15m", "5m"]
 last_trigger = {tf: None for tf in tf_order}
 
+OPEN_ACTIONS = {"open_long", "open_short", "increase_position", "reverse"}
+DEFAULT_OPEN_WHITELIST = set(mainstream_symbols)
+MIN_RR = 1.5
+
+
+def _safe_float(v):
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _calc_rr(action: str, entry: float, stop_loss: float, take_profit: float):
+    if action == "open_long":
+        risk = entry - stop_loss
+        reward = take_profit - entry
+    elif action == "open_short":
+        risk = stop_loss - entry
+        reward = entry - take_profit
+    else:
+        return None
+
+    if risk <= 0 or reward <= 0:
+        return None
+    return reward / risk
+
 async def schedule_loop_async():
     print("⏳ 启动最简调度循环（周期触发 → 下载K线 → 投喂AI + 自动交易）")
 
@@ -83,12 +109,28 @@ async def schedule_loop_async():
                             if not symbol or not action:
                                 continue
 
+                            # ✅ 执行层护栏：只允许主流币开仓，避免山寨方向误判造成连续止损
+                            if action in OPEN_ACTIONS and symbol not in DEFAULT_OPEN_WHITELIST:
+                                continue
+
                             # ---- 止盈止损 ----
                             sl = sig.get("stop_loss")
                             tp = sig.get("take_profit")
 
                             # AI 有可能返回：position_size、quantity、qty
                             position_size = sig.get("position_size") or sig.get("order_value") or sig.get("amount")
+
+                            # ✅ 开仓必须给 SL/TP，并且 RR 达标（否则长期负期望）
+                            if action in {"open_long", "open_short"}:
+                                entry = _safe_float(sig.get("entry"))
+                                sl_f = _safe_float(sl)
+                                tp_f = _safe_float(tp)
+                                if entry is None or sl_f is None or tp_f is None:
+                                    continue
+
+                                rr = _calc_rr(action, entry, sl_f, tp_f)
+                                if rr is None or rr < MIN_RR:
+                                    continue
 
                             # ---- 仅执行允许的操作 ----
                             if action in valid_actions:
