@@ -1,3 +1,14 @@
+import sys
+
+# Windows CMD 默认编码可能是 GBK，打印 emoji 会触发 UnicodeEncodeError；这里强制 UTF-8 并降级替换不可编码字符
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 import time
 import threading
 from notifier import message_worker
@@ -11,7 +22,6 @@ from deepseek_batch_pusher import _is_ready_for_push, push_batch_to_deepseek
 import subprocess
 import signal
 import os
-import sys
 import oi
 
 async def run_async():

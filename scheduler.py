@@ -1,6 +1,13 @@
 import asyncio
 from datetime import datetime, timezone
-from config import monitor_symbols, mainstream_symbols
+from config import (
+    monitor_symbols,
+    mainstream_symbols,
+    OPEN_WHITELIST,
+    MIN_QUOTE_VOLUME_USDT,
+    ALLOW_OPEN_ON_NON_WHITELIST,
+    MAX_MONITOR_SYMBOLS,
+)
 from indicators import calculate_signal_single
 from deepseek_batch_pusher import push_batch_to_deepseek
 from kline_fetcher import fetch_all
@@ -9,12 +16,13 @@ from position_cache import position_records
 from account_positions import get_account_status
 from database import redis_client
 from trader import execute_trade
+from volume_stats import get_24hr_change
 
 tf_order = ["1d", "4h", "1h", "15m", "5m"]
 last_trigger = {tf: None for tf in tf_order}
 
-OPEN_ACTIONS = {"open_long", "open_short", "increase_position", "reverse"}
-DEFAULT_OPEN_WHITELIST = set(mainstream_symbols)
+NEW_OPEN_ACTIONS = {"open_long", "open_short"}
+DEFAULT_OPEN_WHITELIST = set(OPEN_WHITELIST)
 MIN_RR = 1.5
 
 
@@ -38,6 +46,30 @@ def _calc_rr(action: str, entry: float, stop_loss: float, take_profit: float):
     if risk <= 0 or reward <= 0:
         return None
     return reward / risk
+
+def _quote_volume_ok(symbol: str) -> bool:
+    if not MIN_QUOTE_VOLUME_USDT:
+        return True
+    t = get_24hr_change(symbol)
+    if not t:
+        return False
+    qv = t.get("quoteVolume")
+    try:
+        return float(qv) >= float(MIN_QUOTE_VOLUME_USDT)
+    except Exception:
+        return False
+
+def _allow_new_open(symbol: str, sig: dict) -> bool:
+    if symbol in DEFAULT_OPEN_WHITELIST:
+        return True
+    if not ALLOW_OPEN_ON_NON_WHITELIST:
+        return False
+    conf = _safe_float(sig.get("confidence"))
+    if conf is None or conf < 0.80:
+        return False
+    if str(sig.get("priority", "")).upper() != "HIGH":
+        return False
+    return _quote_volume_ok(symbol)
 
 async def schedule_loop_async():
     print("⏳ 启动最简调度循环（周期触发 → 下载K线 → 投喂AI + 自动交易）")
@@ -72,9 +104,10 @@ async def schedule_loop_async():
                 oi_symbols = list(raw_oi)
                 pos_symbols = list(position_records)
 
-                monitor_symbols[:] = list(
-                    dict.fromkeys(mainstream_symbols + pos_symbols + oi_symbols)
-                )
+                merged = list(dict.fromkeys(mainstream_symbols + pos_symbols + oi_symbols))
+                if MAX_MONITOR_SYMBOLS and len(merged) > MAX_MONITOR_SYMBOLS:
+                    merged = merged[: int(MAX_MONITOR_SYMBOLS)]
+                monitor_symbols[:] = merged
 
                 print(f"🔍 监控池: {monitor_symbols} (共 {len(monitor_symbols)} 个币)")
 
@@ -109,8 +142,12 @@ async def schedule_loop_async():
                             if not symbol or not action:
                                 continue
 
-                            # ✅ 执行层护栏：只允许主流币开仓，避免山寨方向误判造成连续止损
-                            if action in OPEN_ACTIONS and symbol not in DEFAULT_OPEN_WHITELIST:
+                            # ✅ 执行层护栏：新开仓仅允许白名单；非白名单必须满足最小流动性门槛
+                            if action in NEW_OPEN_ACTIONS and not _allow_new_open(symbol, sig):
+                                continue
+
+                            # ✅ 加仓必须是已有持仓（否则就是变相开仓）
+                            if action == "increase_position" and symbol not in position_records:
                                 continue
 
                             # ---- 止盈止损 ----
@@ -121,7 +158,7 @@ async def schedule_loop_async():
                             position_size = sig.get("position_size") or sig.get("order_value") or sig.get("amount")
 
                             # ✅ 开仓必须给 SL/TP，并且 RR 达标（否则长期负期望）
-                            if action in {"open_long", "open_short"}:
+                            if action in NEW_OPEN_ACTIONS:
                                 entry = _safe_float(sig.get("entry"))
                                 sl_f = _safe_float(sl)
                                 tp_f = _safe_float(tp)

@@ -2,8 +2,10 @@
 
 ========================
 🧱 硬性交易过滤（必须遵守，违反则输出 wait）
-1) 默认交易白名单（先把方向做对）：仅允许开仓交易 ETHUSDT、SOLUSDT。
-   - 其他币种：只允许 close_* / hold / wait / update_stop_loss / update_take_profit，不允许 open_long/open_short/increase_position/decrease_position/reverse。
+1) 开仓范围（先把方向做对）：
+   - 默认开仓白名单：{{OPEN_WHITELIST}}
+   - 非白名单开仓：只有在 24hr quoteVolume ≥ {{MIN_QUOTE_VOLUME_USDT}} 且 confidence ≥ 0.80 且 priority=HIGH 时，才允许输出 open_long/open_short；否则必须 wait。
+   - 非白名单币种：允许 close_* / hold / wait / update_stop_loss / update_take_profit；若“已持仓”，允许 increase_position/decrease_position（否则必须 wait）。
 2) 只顺势开仓（方向错的主要原因）：
    - 定义趋势：使用对应周期 close 数组（从旧→新，至少 20 根）判断：
      * 上升趋势：close[-1] > close[-5] > close[-10]

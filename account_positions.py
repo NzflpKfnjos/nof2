@@ -1,7 +1,17 @@
+import sys
 import time
 from binance.client import Client
 from config import BINANCE_API_KEY, BINANCE_API_SECRET
 from position_cache import position_records   # ← 引入缓存
+
+# Windows CMD 默认编码可能是 GBK，打印 emoji 会触发 UnicodeEncodeError；这里强制 UTF-8 并降级替换不可编码字符
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # 连接账户，拉高超时防止网络抖动
 client = Client(
@@ -15,9 +25,9 @@ try:
     client.recvWindow = 10000  # 可选：10秒窗口，防止网络延迟
     # 检测服务器时间是否能正常获取
     server_time = client.futures_time()  # futures_time 不支持 requests_params
-    print(f"✅ Binance 时间同步完成，服务器时间: {server_time['serverTime']}")
+    print(f"Binance 时间同步完成，服务器时间: {server_time['serverTime']}")
 except Exception as e:
-    print("⚠ Binance 时间同步失败:", e)
+    print("Binance 时间同步失败:", e)
     
 # 🔥 全量账户数据缓存 — DeepSeek 投喂直接读取
 account_snapshot = {

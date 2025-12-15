@@ -5,7 +5,7 @@ import logging
 import time
 import re
 from concurrent.futures import ThreadPoolExecutor
-from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_URL
+from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL, DEEPSEEK_URL, OPEN_WHITELIST, MIN_QUOTE_VOLUME_USDT
 from database import redis_client
 from volume_stats import (
     calc_volume_compare, get_open_interest, get_funding_rate, get_24hr_change, calc_smart_sentiment,
@@ -52,7 +52,11 @@ def _read_prompt():
     """
     try:
         with open("prompt.txt", "r", encoding="utf-8") as f:
-            return f.read()
+            text = f.read()
+            whitelist = ", ".join([s for s in OPEN_WHITELIST if isinstance(s, str) and s.strip()])
+            text = text.replace("{{OPEN_WHITELIST}}", whitelist or "（空）")
+            text = text.replace("{{MIN_QUOTE_VOLUME_USDT}}", str(MIN_QUOTE_VOLUME_USDT))
+            return text
     except Exception:
         return "你是一名专业量化策略分析引擎，请严格输出 JSON 数组或 JSON 对象形式的交易信号。"
 
